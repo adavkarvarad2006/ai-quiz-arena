@@ -1,15 +1,21 @@
 import Quiz from "../models/Quiz.js";
 import LiveRoom from "../models/LiveRoom.js";
+
 import {
   getRoom,
   startQuestion,
   recordAnswer,
   resetAnsweredFlags,
 } from "./roomState.js";
+
 import { calculatePoints } from "../utils/liveScoring.js";
 import { computeRoomAnalytics } from "../utils/computeRoomAnalytics.js";
 
 const questionTimers = new Map();
+
+/* =========================================================
+   TIMER HELPERS
+========================================================= */
 
 const clearRoomTimer = (roomCode) => {
   const timer = questionTimers.get(roomCode);
@@ -20,606 +26,1267 @@ const clearRoomTimer = (roomCode) => {
   }
 };
 
+/* =========================================================
+   SEND QUESTION
+========================================================= */
+
 const sendQuestion = async (io, roomCode) => {
-  const room = getRoom(roomCode);
-
-  if (!room) return;
-
-  const quiz = await Quiz.findById(room.quizId);
-
-  if (!quiz) {
-    console.error(`Quiz not found for room ${roomCode}`);
-    return;
-  }
-
-  const index = room.currentQuestionIndex;
-  const question = quiz.questions[index];
-
-  if (!question) {
-    await endQuiz(io, roomCode);
-    return;
-  }
-
-  startQuestion(roomCode, index, question.timeLimit);
-  resetAnsweredFlags(roomCode);
-
-  io.to(roomCode).emit("new-question", {
-    questionIndex: index,
-    totalQuestions: quiz.questions.length,
-    question: question.question,
-    options: question.options,
-    timeLimit: question.timeLimit,
-    questionEndsAt: room.questionEndsAt,
-  });
-
-  clearRoomTimer(roomCode);
-
-  const timer = setTimeout(() => {
-    endQuestion(io, roomCode);
-  }, question.timeLimit * 1000);
-
-  questionTimers.set(roomCode, timer);
-};
-
-const endQuestion = async (io, roomCode) => {
-  const room = getRoom(roomCode);
-
-  if (!room) return;
-
-  clearRoomTimer(roomCode);
-
-  const quiz = await Quiz.findById(room.quizId);
-
-  if (!quiz) {
-    console.error(`Quiz not found while ending question for ${roomCode}`);
-    return;
-  }
-
-  const question = quiz.questions[room.currentQuestionIndex];
-
-  if (!question) return;
-
-  const sortedPlayers = [...room.players]
-    .filter((p) => !p.isHost)
-    .sort((a, b) => (b.score || 0) - (a.score || 0));
-
-  const previousRanking = room.previousRanking || [];
-
-  const leaderboard = sortedPlayers.map((p, index) => {
-    const prevIndex = previousRanking.indexOf(p.userId);
-
-    let trend = "same";
-
-    if (prevIndex === -1) {
-      trend = "new";
-    } else if (prevIndex > index) {
-      trend = "up";
-    } else if (prevIndex < index) {
-      trend = "down";
-    }
-
-    return {
-      userId: p.userId,
-      name: p.name,
-      score: p.score || 0,
-      rank: index + 1,
-      trend,
-    };
-  });
-
-  room.previousRanking = sortedPlayers.map((p) => p.userId);
-
-  io.to(roomCode).emit("question-ended", {
-    correctAnswer: question.correctAnswer,
-    explanation: question.explanation,
-    leaderboard,
-  });
-};
-
-const endQuiz = async (io, roomCode) => {
-  const room = getRoom(roomCode);
-
-  if (!room) return;
-
-  // Prevent endQuiz from running multiple times
-  if (room.status === "FINISHED") {
-    console.log(`Quiz ${roomCode} is already finished.`);
-    return;
-  }
-
-  clearRoomTimer(roomCode);
-
-  const quiz = await Quiz.findById(room.quizId);
-
-  if (!quiz) {
-    console.error(`Quiz not found while ending room ${roomCode}`);
-    return;
-  }
-
-  // Mark in-memory room as finished
-  room.status = "FINISHED";
-
-  const sortedPlayers = [...room.players]
-    .filter((p) => !p.isHost)
-    .sort((a, b) => (b.score || 0) - (a.score || 0));
-
-  const previousRanking = room.previousRanking || [];
-
-  const finalLeaderboard = sortedPlayers.map((p, index) => {
-    const prevIndex = previousRanking.indexOf(p.userId);
-
-    let trend = "same";
-
-    if (prevIndex === -1) {
-      trend = "new";
-    } else if (prevIndex > index) {
-      trend = "up";
-    } else if (prevIndex < index) {
-      trend = "down";
-    }
-
-    return {
-      userId: p.userId,
-      name: p.name,
-      score: p.score || 0,
-      rank: index + 1,
-      trend,
-    };
-  });
-
-  room.previousRanking = sortedPlayers.map((p) => p.userId);
-
-  const { questionStats, participants } = computeRoomAnalytics(room, quiz);
-
-  /*
-   * IMPORTANT:
-   *
-   * Save the finished state to MongoDB BEFORE notifying
-   * the frontend that the quiz has finished.
-   *
-   * Otherwise the frontend can click "View Analytics"
-   * before MongoDB has been updated.
-   */
   try {
-    await LiveRoom.findOneAndUpdate(
-      { roomCode },
-      {
-        status: "FINISHED",
-        endedAt: new Date(),
-        participants,
-        questionStats,
-      },
-      {
-        new: true,
-      }
-    );
+    const room = getRoom(roomCode);
 
-    console.log(`Room ${roomCode} successfully saved as FINISHED.`);
-  } catch (err) {
-    console.error("Failed to persist finished room:", err);
+    if (!room) {
+      console.log("SEND QUESTION: Room not found:", roomCode);
+      return;
+    }
+
+    const quiz = await Quiz.findById(room.quizId);
+
+    if (!quiz) {
+      console.log("SEND QUESTION: Quiz not found:", room.quizId);
+      return;
+    }
+
+    const index = room.currentQuestionIndex;
+    const question = quiz.questions[index];
 
     /*
-     * Do NOT tell the frontend that the quiz finished if
-     * we couldn't save the final analytics.
-     *
-     * This prevents the user from immediately opening
-     * analytics while the database is in an inconsistent state.
-     */
-    return;
-  }
+      If there are no more questions,
+      finish the quiz.
+    */
+    if (!question) {
+      console.log(
+        "SEND QUESTION: No more questions. Ending quiz:",
+        roomCode
+      );
 
-  /*
-   * MongoDB is now updated.
-   *
-   * Only after this point do we notify players and host.
-   */
+      await endQuiz(io, roomCode);
+      return;
+    }
 
-  sortedPlayers.forEach((player, index) => {
-    const myStats = participants.find(
-      (p) => p.userId === player.userId
+    startQuestion(
+      roomCode,
+      index,
+      question.timeLimit
     );
 
-    io.to(player.socketId).emit("quiz-finished", {
-      leaderboard: finalLeaderboard,
+    resetAnsweredFlags(roomCode);
 
-      myResult: myStats
-        ? {
-            ...myStats,
-            rank: index + 1,
-            totalQuestions: quiz.questions.length,
-            accuracy:
-              quiz.questions.length > 0
-                ? Math.round(
-                    (myStats.correctAnswers /
-                      quiz.questions.length) *
-                      100
-                  )
-                : 0,
-          }
-        : null,
+    console.log(
+      `Sending question ${index + 1}/${quiz.questions.length} to room ${roomCode}`
+    );
+
+    io.to(roomCode).emit("new-question", {
+      questionIndex: index,
+      totalQuestions: quiz.questions.length,
+
+      question: question.question,
+
+      options: question.options,
+
+      timeLimit: question.timeLimit,
+
+      questionEndsAt: room.questionEndsAt,
     });
-  });
 
-  const hostPlayer = room.players.find((p) => p.isHost);
+    clearRoomTimer(roomCode);
 
-  if (hostPlayer) {
-    io.to(hostPlayer.socketId).emit("quiz-finished", {
-      leaderboard: finalLeaderboard,
-    });
+    const timer = setTimeout(() => {
+      endQuestion(io, roomCode);
+    }, question.timeLimit * 1000);
+
+    questionTimers.set(roomCode, timer);
+  } catch (error) {
+    console.error(
+      "SEND QUESTION ERROR:",
+      error
+    );
   }
-
-  console.log(`Quiz ${roomCode} finished successfully.`);
 };
 
-export const initQuizSocket = (io) => {
-  io.on("connection", (socket) => {
-    socket.on(
-      "join-room",
-      ({ roomCode, name, userId, isHost }) => {
-        const room = getRoom(roomCode);
+/* =========================================================
+   END CURRENT QUESTION
+========================================================= */
 
-        if (!room) {
-          socket.emit("room-error", {
-            message:
-              "Room not found. Check the code and try again.",
-          });
-          return;
-        }
+const endQuestion = async (io, roomCode) => {
+  try {
+    const room = getRoom(roomCode);
 
-        const existingPlayer = room.players.find(
-          (p) => p.userId === userId
-        );
+    if (!room) {
+      console.log(
+        "END QUESTION: Room not found:",
+        roomCode
+      );
+      return;
+    }
 
-        if (room.status === "FINISHED" && !existingPlayer) {
-          socket.emit("room-error", {
-            message: "This quiz has already finished.",
-          });
-          return;
-        }
+    clearRoomTimer(roomCode);
 
-        if (room.status === "IN_PROGRESS" && !existingPlayer) {
-          socket.emit("room-error", {
-            message:
-              "This quiz is already in progress. You can't join mid-game.",
-          });
-          return;
-        }
+    const quiz = await Quiz.findById(room.quizId);
 
-        if (existingPlayer) {
-          existingPlayer.socketId = socket.id;
-          existingPlayer.connected = true;
+    if (!quiz) {
+      console.log(
+        "END QUESTION: Quiz not found:",
+        room.quizId
+      );
+      return;
+    }
 
-          // Make sure the host flag remains correct
-          if (isHost) {
-            existingPlayer.isHost = true;
+    const question =
+      quiz.questions[room.currentQuestionIndex];
+
+    if (!question) {
+      return;
+    }
+
+    const sortedPlayers = [...room.players]
+      .filter((p) => !p.isHost)
+      .sort(
+        (a, b) =>
+          (b.score || 0) -
+          (a.score || 0)
+      );
+
+    const previousRanking =
+      room.previousRanking || [];
+
+    const leaderboard =
+      sortedPlayers.map(
+        (player, index) => {
+          const prevIndex =
+            previousRanking.indexOf(
+              player.userId
+            );
+
+          let trend = "same";
+
+          if (prevIndex === -1) {
+            trend = "new";
+          } else if (prevIndex > index) {
+            trend = "up";
+          } else if (prevIndex < index) {
+            trend = "down";
           }
-        } else {
-          room.players.push({
-            socketId: socket.id,
-            userId,
-            name,
-            isHost: !!isHost,
-            score: 0,
-            answered: false,
-            connected: true,
-          });
+
+          return {
+            userId: player.userId,
+            name: player.name,
+            score: player.score || 0,
+            rank: index + 1,
+            trend,
+          };
+        }
+      );
+
+    room.previousRanking =
+      sortedPlayers.map(
+        (player) => player.userId
+      );
+
+    io.to(roomCode).emit(
+      "question-ended",
+      {
+        correctAnswer:
+          question.correctAnswer,
+
+        explanation:
+          question.explanation,
+
+        leaderboard,
+      }
+    );
+
+    console.log(
+      "QUESTION ENDED:",
+      roomCode,
+      "Question:",
+      room.currentQuestionIndex + 1
+    );
+  } catch (error) {
+    console.error(
+      "END QUESTION ERROR:",
+      error
+    );
+  }
+};
+
+/* =========================================================
+   END QUIZ
+========================================================= */
+
+const endQuiz = async (io, roomCode) => {
+  try {
+    const room = getRoom(roomCode);
+
+    if (!room) {
+      console.log(
+        "END QUIZ: Room not found:",
+        roomCode
+      );
+      return;
+    }
+
+    console.log(
+      "END QUIZ CALLED:",
+      roomCode
+    );
+
+    clearRoomTimer(roomCode);
+
+    room.status = "FINISHED";
+
+    const quiz = await Quiz.findById(
+      room.quizId
+    );
+
+    if (!quiz) {
+      console.log(
+        "END QUIZ: Quiz not found:",
+        room.quizId
+      );
+      return;
+    }
+
+    const sortedPlayers = [
+      ...room.players,
+    ]
+      .filter((p) => !p.isHost)
+      .sort(
+        (a, b) =>
+          (b.score || 0) -
+          (a.score || 0)
+      );
+
+    const previousRanking =
+      room.previousRanking || [];
+
+    const finalLeaderboard =
+      sortedPlayers.map(
+        (player, index) => {
+          const prevIndex =
+            previousRanking.indexOf(
+              player.userId
+            );
+
+          let trend = "same";
+
+          if (prevIndex === -1) {
+            trend = "new";
+          } else if (prevIndex > index) {
+            trend = "up";
+          } else if (prevIndex < index) {
+            trend = "down";
+          }
+
+          return {
+            userId: player.userId,
+            name: player.name,
+            score: player.score || 0,
+            rank: index + 1,
+            trend,
+          };
+        }
+      );
+
+    /*
+      Calculate analytics BEFORE saving.
+    */
+
+    const {
+      questionStats,
+      participants,
+    } =
+      computeRoomAnalytics(
+        room,
+        quiz
+      );
+
+    /*
+      IMPORTANT:
+      Save FINISHED status to MongoDB FIRST.
+      
+      This prevents the race condition where
+      frontend navigates to analytics before
+      MongoDB has been updated.
+    */
+
+    try {
+      await LiveRoom.findOneAndUpdate(
+        {
+          roomCode,
+        },
+        {
+          status: "FINISHED",
+
+          endedAt: new Date(),
+
+          participants,
+
+          questionStats,
+        },
+        {
+          new: true,
+        }
+      );
+
+      console.log(
+        "QUIZ SAVED AS FINISHED:",
+        roomCode
+      );
+    } catch (dbError) {
+      console.error(
+        "FAILED TO SAVE FINISHED ROOM:",
+        dbError
+      );
+
+      /*
+        Don't tell frontend quiz finished
+        if MongoDB update failed.
+      */
+
+      return;
+    }
+
+    /*
+      Send results to players.
+    */
+
+    sortedPlayers.forEach(
+      (player, index) => {
+        const myStats =
+          participants.find(
+            (p) =>
+              String(p.userId) ===
+              String(player.userId)
+          );
+
+        if (!player.socketId) {
+          return;
         }
 
-        socket.join(roomCode);
+        io.to(
+          player.socketId
+        ).emit(
+          "quiz-finished",
+          {
+            leaderboard:
+              finalLeaderboard,
 
-        socket.data.roomCode = roomCode;
-        socket.data.userId = userId;
-        socket.data.isHost = !!isHost;
+            myResult: myStats
+              ? {
+                  ...myStats,
 
-        io.to(roomCode).emit(
-          "player-joined",
-          room.players
+                  rank:
+                    index + 1,
+
+                  totalQuestions:
+                    quiz.questions.length,
+
+                  accuracy:
+                    quiz.questions.length >
+                    0
+                      ? Math.round(
+                          (myStats.correctAnswers /
+                            quiz
+                              .questions
+                              .length) *
+                            100
+                        )
+                      : 0,
+                }
+              : null,
+          }
         );
+      }
+    );
 
-        if (isHost && room.status === "PAUSED") {
-          room.status = "IN_PROGRESS";
+    /*
+      Send finished event to host.
+    */
+
+    const hostPlayer =
+      room.players.find(
+        (player) =>
+          player.isHost
+      );
+
+    if (
+      hostPlayer &&
+      hostPlayer.socketId
+    ) {
+      console.log(
+        "Sending quiz-finished to host:",
+        hostPlayer.socketId
+      );
+
+      io.to(
+        hostPlayer.socketId
+      ).emit(
+        "quiz-finished",
+        {
+          leaderboard:
+            finalLeaderboard,
+        }
+      );
+    }
+
+    /*
+      Also emit to the entire room.
+      This makes the finish event more reliable
+      if the host/player socket state changed.
+    */
+
+    io.to(roomCode).emit(
+      "quiz-completed",
+      {
+        leaderboard:
+          finalLeaderboard,
+      }
+    );
+
+    console.log(
+      "QUIZ FINISHED SUCCESSFULLY:",
+      roomCode
+    );
+  } catch (error) {
+    console.error(
+      "END QUIZ ERROR:",
+      error
+    );
+  }
+};
+
+/* =========================================================
+   SOCKET INITIALIZATION
+========================================================= */
+
+export const initQuizSocket = (io) => {
+  io.on(
+    "connection",
+    (socket) => {
+      console.log(
+        "SOCKET CONNECTED:",
+        socket.id
+      );
+
+      /* =====================================================
+         JOIN ROOM
+      ===================================================== */
+
+      socket.on(
+        "join-room",
+        ({
+          roomCode,
+          name,
+          userId,
+          isHost,
+        }) => {
+          console.log(
+            "JOIN ROOM:",
+            roomCode,
+            "User:",
+            userId,
+            "Host:",
+            isHost
+          );
+
+          const room =
+            getRoom(roomCode);
+
+          if (!room) {
+            console.log(
+              "JOIN ROOM FAILED - ROOM NOT FOUND:",
+              roomCode
+            );
+
+            socket.emit(
+              "room-error",
+              {
+                message:
+                  "Room not found. Check the code and try again.",
+              }
+            );
+
+            return;
+          }
+
+          /*
+            Compare user IDs as strings.
+          */
+
+          const existingPlayer =
+            room.players.find(
+              (player) =>
+                String(
+                  player.userId
+                ) ===
+                String(userId)
+            );
+
+          /*
+            Don't allow new players
+            to join a finished quiz.
+          */
+
+          if (
+            room.status ===
+              "FINISHED" &&
+            !existingPlayer
+          ) {
+            socket.emit(
+              "room-error",
+              {
+                message:
+                  "This quiz has already finished.",
+              }
+            );
+
+            return;
+          }
+
+          /*
+            Don't allow new players
+            to join after quiz started.
+          */
+
+          if (
+            room.status ===
+              "IN_PROGRESS" &&
+            !existingPlayer
+          ) {
+            socket.emit(
+              "room-error",
+              {
+                message:
+                  "This quiz is already in progress. You can't join mid-game.",
+              }
+            );
+
+            return;
+          }
+
+          /*
+            Reconnecting player
+          */
+
+          if (existingPlayer) {
+            existingPlayer.socketId =
+              socket.id;
+
+            existingPlayer.connected =
+              true;
+
+            console.log(
+              "PLAYER RECONNECTED:",
+              userId
+            );
+          }
+
+          /*
+            New player
+          */
+
+          else {
+            room.players.push({
+              socketId:
+                socket.id,
+
+              userId,
+
+              name,
+
+              isHost:
+                !!isHost,
+
+              score: 0,
+
+              answered: false,
+
+              connected: true,
+            });
+
+            console.log(
+              "NEW PLAYER ADDED:",
+              name
+            );
+          }
+
+          socket.join(roomCode);
+
+          socket.data.roomCode =
+            roomCode;
+
+          socket.data.userId =
+            userId;
+
+          socket.data.isHost =
+            !!isHost;
 
           io.to(roomCode).emit(
-            "host-reconnected"
+            "player-joined",
+            room.players
           );
+
+          /*
+            Host reconnecting after pause.
+          */
+
+          if (
+            isHost &&
+            room.status ===
+              "PAUSED"
+          ) {
+            room.status =
+              "IN_PROGRESS";
+
+            io.to(roomCode).emit(
+              "host-reconnected"
+            );
+
+            console.log(
+              "HOST RECONNECTED:",
+              roomCode
+            );
+          }
         }
-      }
-    );
+      );
 
-    socket.on(
-      "get-room-state",
-      async ({ roomCode }) => {
-        const room = getRoom(roomCode);
+      /* =====================================================
+         GET ROOM STATE
+      ===================================================== */
 
-        if (!room) {
-          socket.emit("room-error", {
-            message: "Room not found",
-          });
-          return;
+      socket.on(
+        "get-room-state",
+        async ({
+          roomCode,
+        }) => {
+          try {
+            console.log(
+              "GET ROOM STATE:",
+              roomCode
+            );
+
+            const room =
+              getRoom(roomCode);
+
+            if (!room) {
+              socket.emit(
+                "room-error",
+                {
+                  message:
+                    "Room not found",
+                }
+              );
+
+              return;
+            }
+
+            if (
+              room.status !==
+                "IN_PROGRESS" ||
+              room.currentQuestionIndex <
+                0
+            ) {
+              socket.emit(
+                "room-state",
+                {
+                  status:
+                    room.status,
+
+                  question:
+                    null,
+                }
+              );
+
+              return;
+            }
+
+            const quiz =
+              await Quiz.findById(
+                room.quizId
+              );
+
+            if (!quiz) {
+              return;
+            }
+
+            const question =
+              quiz.questions[
+                room.currentQuestionIndex
+              ];
+
+            if (!question) {
+              socket.emit(
+                "room-state",
+                {
+                  status:
+                    room.status,
+
+                  question:
+                    null,
+                }
+              );
+
+              return;
+            }
+
+            socket.emit(
+              "room-state",
+              {
+                status:
+                  room.status,
+
+                question: {
+                  questionIndex:
+                    room.currentQuestionIndex,
+
+                  totalQuestions:
+                    quiz.questions.length,
+
+                  question:
+                    question.question,
+
+                  options:
+                    question.options,
+
+                  timeLimit:
+                    question.timeLimit,
+
+                  questionEndsAt:
+                    room.questionEndsAt,
+                },
+              }
+            );
+          } catch (error) {
+            console.error(
+              "GET ROOM STATE ERROR:",
+              error
+            );
+          }
         }
+      );
 
-        if (
-          room.status !== "IN_PROGRESS" ||
-          room.currentQuestionIndex < 0
-        ) {
-          socket.emit("room-state", {
-            status: room.status,
-            question: null,
-          });
-          return;
+      /* =====================================================
+         START QUIZ
+      ===================================================== */
+
+      socket.on(
+        "start-quiz",
+        async ({
+          roomCode,
+        }) => {
+          try {
+            console.log(
+              "START QUIZ REQUEST:",
+              roomCode
+            );
+
+            const room =
+              getRoom(roomCode);
+
+            if (!room) {
+              socket.emit(
+                "room-error",
+                {
+                  message:
+                    "Room not found",
+                }
+              );
+
+              return;
+            }
+
+            console.log(
+              "Room hostId:",
+              room.hostId
+            );
+
+            console.log(
+              "Socket userId:",
+              socket.data.userId
+            );
+
+            /*
+              IMPORTANT FIX:
+              Compare IDs as strings.
+            */
+
+            if (
+              String(
+                room.hostId
+              ) !==
+              String(
+                socket.data.userId
+              )
+            ) {
+              console.log(
+                "START QUIZ DENIED - NOT HOST"
+              );
+
+              socket.emit(
+                "room-error",
+                {
+                  message:
+                    "Only the host can start the quiz",
+                }
+              );
+
+              return;
+            }
+
+            room.status =
+              "IN_PROGRESS";
+
+            room.currentQuestionIndex =
+              0;
+
+            room.previousRanking =
+              [];
+
+            io.to(roomCode).emit(
+              "quiz-started"
+            );
+
+            console.log(
+              "QUIZ STARTED:",
+              roomCode
+            );
+
+            await sendQuestion(
+              io,
+              roomCode
+            );
+          } catch (error) {
+            console.error(
+              "START QUIZ ERROR:",
+              error
+            );
+          }
         }
+      );
 
-        const quiz = await Quiz.findById(room.quizId);
+      /* =====================================================
+         SUBMIT ANSWER
+      ===================================================== */
 
-        if (!quiz) {
-          socket.emit("room-error", {
-            message: "Quiz not found",
-          });
-          return;
-        }
-
-        const question =
-          quiz.questions[room.currentQuestionIndex];
-
-        if (!question) {
-          socket.emit("room-state", {
-            status: room.status,
-            question: null,
-          });
-          return;
-        }
-
-        socket.emit("room-state", {
-          status: room.status,
-          question: {
-            questionIndex:
-              room.currentQuestionIndex,
-            totalQuestions:
-              quiz.questions.length,
-            question: question.question,
-            options: question.options,
-            timeLimit: question.timeLimit,
-            questionEndsAt:
-              room.questionEndsAt,
-          },
-        });
-      }
-    );
-
-    socket.on(
-      "start-quiz",
-      async ({ roomCode }) => {
-        const room = getRoom(roomCode);
-
-        if (!room) return;
-
-        if (room.hostId !== socket.data.userId) {
-          socket.emit("room-error", {
-            message:
-              "Only the host can start the quiz",
-          });
-          return;
-        }
-
-        room.status = "IN_PROGRESS";
-        room.currentQuestionIndex = 0;
-        room.previousRanking = [];
-
-        io.to(roomCode).emit("quiz-started");
-
-        await sendQuestion(io, roomCode);
-      }
-    );
-
-    socket.on(
-      "submit-answer",
-      async ({
-        roomCode,
-        questionIndex,
-        selectedAnswer,
-      }) => {
-        const room = getRoom(roomCode);
-
-        if (!room) return;
-
-        const userId = socket.data.userId;
-
-        if (
-          room.currentQuestionIndex !==
-          questionIndex
-        ) {
-          return;
-        }
-
-        if (
-          room.answers[questionIndex]?.[userId]
-        ) {
-          return;
-        }
-
-        if (
-          Date.now() > room.questionEndsAt
-        ) {
-          return;
-        }
-
-        const quiz = await Quiz.findById(
-          room.quizId
-        );
-
-        if (!quiz) return;
-
-        const question =
-          quiz.questions[questionIndex];
-
-        if (!question) return;
-
-        const correct =
-          selectedAnswer ===
-          question.correctAnswer;
-
-        const timeTaken =
-          (Date.now() -
-            room.questionStartedAt) /
-          1000;
-
-        const points = calculatePoints(
-          correct,
-          timeTaken,
-          question.timeLimit
-        );
-
-        recordAnswer(
+      socket.on(
+        "submit-answer",
+        async ({
           roomCode,
           questionIndex,
-          userId,
           selectedAnswer,
-          timeTaken,
-          correct,
-          points
-        );
+        }) => {
+          try {
+            const room =
+              getRoom(roomCode);
 
-        socket.emit("answer-received", {
-          correct,
-          points,
-        });
+            if (!room) {
+              return;
+            }
 
-        const nonHostPlayers =
-          room.players.filter(
-            (p) => !p.isHost
-          );
+            const userId =
+              socket.data.userId;
 
-        const answeredCount = Object.keys(
-          room.answers[questionIndex] || {}
-        ).length;
+            /*
+              Ignore old question answers.
+            */
 
-        io.to(roomCode).emit(
-          "answer-progress",
-          {
-            answered: answeredCount,
-            total: nonHostPlayers.length,
+            if (
+              room.currentQuestionIndex !==
+              questionIndex
+            ) {
+              return;
+            }
+
+            /*
+              Prevent duplicate answers.
+            */
+
+            if (
+              room.answers[
+                questionIndex
+              ]?.[userId]
+            ) {
+              return;
+            }
+
+            /*
+              Don't accept answers
+              after timer expires.
+            */
+
+            if (
+              Date.now() >
+              room.questionEndsAt
+            ) {
+              return;
+            }
+
+            const quiz =
+              await Quiz.findById(
+                room.quizId
+              );
+
+            if (!quiz) {
+              return;
+            }
+
+            const question =
+              quiz.questions[
+                questionIndex
+              ];
+
+            if (!question) {
+              return;
+            }
+
+            const correct =
+              selectedAnswer ===
+              question.correctAnswer;
+
+            const timeTaken =
+              (Date.now() -
+                room.questionStartedAt) /
+              1000;
+
+            const points =
+              calculatePoints(
+                correct,
+                timeTaken,
+                question.timeLimit
+              );
+
+            recordAnswer(
+              roomCode,
+              questionIndex,
+              userId,
+              selectedAnswer,
+              timeTaken,
+              correct,
+              points
+            );
+
+            socket.emit(
+              "answer-received",
+              {
+                correct,
+                points,
+              }
+            );
+
+            const nonHostPlayers =
+              room.players.filter(
+                (player) =>
+                  !player.isHost
+              );
+
+            const answeredCount =
+              Object.keys(
+                room.answers[
+                  questionIndex
+                ] || {}
+              ).length;
+
+            io.to(roomCode).emit(
+              "answer-progress",
+              {
+                answered:
+                  answeredCount,
+
+                total:
+                  nonHostPlayers.length,
+              }
+            );
+
+            /*
+              Only auto-end when
+              there is at least one player.
+            */
+
+            if (
+              nonHostPlayers.length >
+                0 &&
+              answeredCount >=
+                nonHostPlayers.length
+            ) {
+              await endQuestion(
+                io,
+                roomCode
+              );
+            }
+          } catch (error) {
+            console.error(
+              "SUBMIT ANSWER ERROR:",
+              error
+            );
           }
-        );
-
-        if (
-          nonHostPlayers.length > 0 &&
-          answeredCount >=
-            nonHostPlayers.length
-        ) {
-          await endQuestion(
-            io,
-            roomCode
-          );
         }
-      }
-    );
-
-    socket.on(
-      "next-question",
-      async ({ roomCode }) => {
-        const room = getRoom(roomCode);
-
-        if (!room) return;
-
-        if (
-          room.hostId !== socket.data.userId
-        ) {
-          console.log(
-            "NEXT QUESTION REJECTED: not host"
-          );
-          return;
-        }
-
-        if (room.status !== "IN_PROGRESS") {
-          console.log(
-            `NEXT QUESTION REJECTED: room status is ${room.status}`
-          );
-          return;
-        }
-
-        room.currentQuestionIndex += 1;
-
-        console.log(
-          `Moving to question ${room.currentQuestionIndex + 1}`
-        );
-
-        await sendQuestion(
-          io,
-          roomCode
-        );
-      }
-    );
-
-    socket.on(
-      "end-quiz",
-      async ({ roomCode }) => {
-        const room = getRoom(roomCode);
-
-        if (!room) return;
-
-        if (
-          room.hostId !== socket.data.userId
-        ) {
-          console.log(
-            "END QUIZ REJECTED: not host"
-          );
-          return;
-        }
-
-        console.log(
-          `Ending quiz ${roomCode}`
-        );
-
-        await endQuiz(
-          io,
-          roomCode
-        );
-      }
-    );
-
-    socket.on("disconnect", () => {
-      const roomCode =
-        socket.data.roomCode;
-
-      if (!roomCode) return;
-
-      const room = getRoom(roomCode);
-
-      if (!room) return;
-
-      const player = room.players.find(
-        (p) => p.socketId === socket.id
       );
 
-      if (player) {
-        player.connected = false;
-      }
+      /* =====================================================
+         NEXT QUESTION
+      ===================================================== */
 
-      if (room.status === "WAITING") {
-        room.players =
-          room.players.filter(
-            (p) =>
-              p.socketId !== socket.id
-          );
-      }
+      socket.on(
+        "next-question",
+        async ({
+          roomCode,
+        }) => {
+          try {
+            console.log(
+              "NEXT QUESTION REQUEST:",
+              roomCode
+            );
 
-      io.to(roomCode).emit(
-        "player-joined",
-        room.players
+            const room =
+              getRoom(roomCode);
+
+            if (!room) {
+              console.log(
+                "NEXT QUESTION: ROOM NOT FOUND"
+              );
+
+              socket.emit(
+                "room-error",
+                {
+                  message:
+                    "Room not found",
+                }
+              );
+
+              return;
+            }
+
+            console.log(
+              "Room hostId:",
+              room.hostId
+            );
+
+            console.log(
+              "Socket userId:",
+              socket.data.userId
+            );
+
+            /*
+              IMPORTANT FIX:
+              Compare IDs as strings.
+            */
+
+            if (
+              String(
+                room.hostId
+              ) !==
+              String(
+                socket.data.userId
+              )
+            ) {
+              console.log(
+                "NEXT QUESTION DENIED - NOT HOST"
+              );
+
+              socket.emit(
+                "room-error",
+                {
+                  message:
+                    "Only the host can move to the next question",
+                }
+              );
+
+              return;
+            }
+
+            room.currentQuestionIndex +=
+              1;
+
+            console.log(
+              "Moving to question index:",
+              room.currentQuestionIndex
+            );
+
+            await sendQuestion(
+              io,
+              roomCode
+            );
+          } catch (error) {
+            console.error(
+              "NEXT QUESTION ERROR:",
+              error
+            );
+          }
+        }
       );
 
-      if (
-        player?.isHost &&
-        room.status === "IN_PROGRESS"
-      ) {
-        room.status = "PAUSED";
+      /* =====================================================
+         END QUIZ BUTTON
+      ===================================================== */
 
-        clearRoomTimer(roomCode);
+      socket.on(
+        "end-quiz",
+        async ({
+          roomCode,
+        }) => {
+          try {
+            console.log(
+              "END QUIZ REQUEST:",
+              roomCode
+            );
 
-        io.to(roomCode).emit(
-          "host-disconnected"
-        );
-      }
-    });
-  });
+            const room =
+              getRoom(roomCode);
+
+            if (!room) {
+              console.log(
+                "END QUIZ: ROOM NOT FOUND"
+              );
+
+              socket.emit(
+                "room-error",
+                {
+                  message:
+                    "Room not found",
+                }
+              );
+
+              return;
+            }
+
+            console.log(
+              "Room hostId:",
+              room.hostId
+            );
+
+            console.log(
+              "Socket userId:",
+              socket.data.userId
+            );
+
+            /*
+              IMPORTANT FIX:
+              Compare IDs as strings.
+            */
+
+            if (
+              String(
+                room.hostId
+              ) !==
+              String(
+                socket.data.userId
+              )
+            ) {
+              console.log(
+                "END QUIZ DENIED - NOT HOST"
+              );
+
+              socket.emit(
+                "room-error",
+                {
+                  message:
+                    "Only the host can end the quiz",
+                }
+              );
+
+              return;
+            }
+
+            await endQuiz(
+              io,
+              roomCode
+            );
+          } catch (error) {
+            console.error(
+              "END QUIZ REQUEST ERROR:",
+              error
+            );
+          }
+        }
+      );
+
+      /* =====================================================
+         DISCONNECT
+      ===================================================== */
+
+      socket.on(
+        "disconnect",
+        () => {
+          console.log(
+            "SOCKET DISCONNECTED:",
+            socket.id
+          );
+
+          const roomCode =
+            socket.data.roomCode;
+
+          if (!roomCode) {
+            return;
+          }
+
+          const room =
+            getRoom(roomCode);
+
+          if (!room) {
+            return;
+          }
+
+          const player =
+            room.players.find(
+              (p) =>
+                p.socketId ===
+                socket.id
+            );
+
+          if (player) {
+            player.connected =
+              false;
+          }
+
+          /*
+            Remove players from
+            waiting rooms.
+          */
+
+          if (
+            room.status ===
+            "WAITING"
+          ) {
+            room.players =
+              room.players.filter(
+                (p) =>
+                  p.socketId !==
+                  socket.id
+              );
+          }
+
+          io.to(roomCode).emit(
+            "player-joined",
+            room.players
+          );
+
+          /*
+            Pause quiz if host disconnects.
+          */
+
+          if (
+            player?.isHost &&
+            room.status ===
+              "IN_PROGRESS"
+          ) {
+            room.status =
+              "PAUSED";
+
+            clearRoomTimer(
+              roomCode
+            );
+
+            io.to(roomCode).emit(
+              "host-disconnected"
+            );
+
+            console.log(
+              "HOST DISCONNECTED - QUIZ PAUSED:",
+              roomCode
+            );
+          }
+        }
+      );
+    }
+  );
 };
