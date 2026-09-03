@@ -50,7 +50,7 @@ function RoomAnalytics() {
         <div className="bg-white p-6 rounded-lg shadow">
           <h2 className="font-semibold mb-3">Participants</h2>
           <div className="space-y-2">
-            {analytics.participants
+            {[...analytics.participants]
               .sort((a, b) => b.finalScore - a.finalScore)
               .map((p, i) => (
                 <div key={p.userId} className="flex justify-between text-sm border-b pb-2">

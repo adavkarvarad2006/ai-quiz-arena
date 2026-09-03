@@ -2,7 +2,7 @@ import mongoose from "mongoose";
 
 const participantSchema = new mongoose.Schema(
   {
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    userId: { type: String, required: true },
     name: { type: String, required: true },
     finalScore: { type: Number, default: 0 },
     correctAnswers: { type: Number, default: 0 },

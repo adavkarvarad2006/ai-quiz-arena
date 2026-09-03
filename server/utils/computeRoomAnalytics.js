@@ -30,7 +30,7 @@ export const computeRoomAnalytics = (room, quiz) => {
     let answeredCount = 0;
 
     quiz.questions.forEach((_, index) => {
-      const answer = room.answers[index]?.[player.userId];
+      const answer = room.answers[index]?.[String(player.userId)];
       if (answer) {
         answeredCount++;
         totalTime += answer.timeTaken;
@@ -40,7 +40,7 @@ export const computeRoomAnalytics = (room, quiz) => {
     });
 
     return {
-      userId: player.userId,
+      userId: String(player.userId),
       name: player.name,
       finalScore: player.score || 0,
       correctAnswers,
