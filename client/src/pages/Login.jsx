@@ -62,9 +62,25 @@ function Login() {
           {loading ? "Logging in..." : "Login"}
         </button>
 
+        <div className="relative my-4">
+          <div className="absolute inset-0 flex items-center">
+            <div className="w-full border-t border-gray-300"></div>
+          </div>
+          <div className="relative flex justify-center text-xs uppercase">
+            <span className="bg-white px-2 text-gray-500">Or</span>
+          </div>
+        </div>
+
+        <Link
+          to="/join"
+          className="block w-full text-center bg-purple-600 text-white py-2 rounded hover:bg-purple-700 font-medium"
+        >
+          🎮 Join Room with Code
+        </Link>
+
         <p className="text-sm text-center mt-4">
           Don't have an account?{" "}
-          <Link to="/register" className="text-blue-600">
+          <Link to="/register" className="text-blue-600 font-medium hover:underline">
             Register
           </Link>
         </p>
