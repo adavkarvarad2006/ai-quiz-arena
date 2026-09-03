@@ -15,7 +15,7 @@ function TakeQuiz() {
   const [selectedOption, setSelectedOption] = useState(null);
   const [answers, setAnswers] = useState([]);
   const [timeLeft, setTimeLeft] = useState(0);
-  const questionStartRef = useRef(Date.now());
+  const questionStartRef = useRef(0);
   const selectedOptionRef = useRef(null);
 
   useEffect(() => {
@@ -25,9 +25,18 @@ function TakeQuiz() {
 
   const currentQuestion = currentQuiz?.questions?.[currentIndex];
 
+  const [prevIndex, setPrevIndex] = useState(currentIndex);
+  if (prevIndex !== currentIndex) {
+    setPrevIndex(currentIndex);
+    setSelectedOption(null);
+    if (currentQuestion) {
+      setTimeLeft(currentQuestion.timeLimit);
+    }
+  }
+
   const goToNext = useCallback(
     (chosenOption) => {
-      const timeTaken = Math.round((Date.now() - questionStartRef.current) / 1000);
+      const timeTaken = Math.round((Date.now() - (questionStartRef.current || Date.now())) / 1000);
 
       const newAnswer = {
         questionId: currentQuestion._id,
@@ -61,10 +70,8 @@ function TakeQuiz() {
   useEffect(() => {
     if (!currentQuestion) return;
 
-    let remaining = currentQuestion.timeLimit;
-    setTimeLeft(remaining);
-    setSelectedOption(null);
     questionStartRef.current = Date.now();
+    let remaining = currentQuestion.timeLimit;
 
     const interval = setInterval(() => {
       remaining -= 1;
@@ -78,8 +85,7 @@ function TakeQuiz() {
     }, 1000);
 
     return () => clearInterval(interval);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentIndex, currentQuestion]);
+  }, [currentIndex, currentQuestion, goToNext]);
 
   const handleSelect = (option) => {
     setSelectedOption(option);
